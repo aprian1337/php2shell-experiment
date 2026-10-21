@@ -1,0 +1,28 @@
+services:
+  apache-modphp:
+    image: php:8.2.34-apache
+    container_name: php2shell-apache
+    ports:
+      - "18080:80"
+    volumes:
+      - ./www:/var/www/html
+      - ./apache/php.ini:/usr/local/etc/php/conf.d/zz-lab.ini
+
+  fpm:
+    image: php:8.2.34-fpm
+    container_name: php2shell-fpm
+    volumes:
+      - ./www:/var/www/html
+      - ./fpm/php.ini:/usr/local/etc/php/conf.d/zz-lab.ini
+      - ./fpm/zz-pm.conf:/usr/local/etc/php-fpm.d/zz-pm.conf
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: php2shell-nginx
+    ports:
+      - "18081:80"
+    volumes:
+      - ./www:/var/www/html:ro
+      - ./fpm/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - fpm
