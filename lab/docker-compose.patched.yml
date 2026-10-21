@@ -1,0 +1,16 @@
+# Control experiment: same lab, patched PHP 8.2.35.
+#
+#   cd lab
+#   docker compose -f docker-compose.yml -f docker-compose.patched.yml up -d --build
+#
+# Expected result: probe still reports FEATURE-ON (the ini setting did not
+# change), but arm and oom stop reporting a reachable path, and check.py uaf
+# against the ASAN image produces no sanitizer report. That contrast is the
+# evidence the harness is honest.
+
+services:
+  apache-modphp:
+    image: php:8.2.35-apache
+
+  fpm:
+    image: php:8.2.35-fpm

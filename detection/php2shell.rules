@@ -1,0 +1,69 @@
+# PHP2Shell detection signatures (CVE-2026-109618 / CVE-2026-109619).
+# First-pass network signatures for the two traffic shapes the lab produces:
+# the stall-window arming POST and the chunked OOM-probe POST.
+#
+# These are heuristic. They catch the *shape* of the attack, not the bug
+# itself, and a determined operator can vary the shape. Use them as a tripwire
+# while you patch, not as a substitute for patching.
+
+# --- Suricata / Snort -------------------------------------------------------
+
+# Arming/recon: any multipart POST carrying the upload-progress field.
+# Every PHP2Shell chain starts here. Loud but unambiguous; tune threshold
+# per-site if your app legitimately uses session.upload_progress.
+alert http any any -> any $HTTP_PORTS ( \
+    msg:"PHP2Shell: multipart POST with PHP_SESSION_UPLOAD_PROGRESS field"; \
+    flow:established,to_server; \
+    content:"PHP_SESSION_UPLOAD_PROGRESS"; \
+    http_client_body; \
+    sid:261096180; rev:1; \
+    metadata:severity medium, cve CVE_2026_109618, cve CVE_2026_109619; \
+)
+
+# OOM probe: chunked transfer-encoding with a multipart body and no
+# Content-Length. Legitimate chunked uploads exist, so pair with the
+# header-count or progress-field rules before alerting.
+alert http any any -> any $HTTP_PORTS ( \
+    msg:"PHP2Shell: chunked multipart POST without Content-Length (OOM arm)"; \
+    flow:established,to_server; \
+    http.header:"Transfer-Encoding: chunked"; \
+    content:"multipart/form-data"; \
+    http.header; \
+    sid:261096181; rev:1; \
+    metadata:severity high, cve CVE_2026_109618; \
+)
+
+# Worker-side aftermath: PHP emitting memory-limit fatals in response bodies
+# at unusual rates. Best run as a threshold rule on your reverse proxy logs.
+# alert http any any -> any $HTTP_PORTS ( \
+#     msg:"PHP2Shell: PHP memory-limit fatal in response"; \
+#     flow:established,to_client; \
+#     content:"Allowed memory size"; \
+#     http.response_body; \
+#     sid:261096182; rev:1; \
+# )
+
+# --- ModSecurity (CRS-compatible) -------------------------------------------
+
+# High request-header count on an upload-progress POST. The OOM probe sends
+# ~10k headers in one part to amplify engine memory past memory_limit.
+# &REQUEST_HEADERS counts headers; 200 is far above normal browser traffic.
+SecRule &REQUEST_HEADERS "@gt 200" \
+    "id:261096190,phase:1,pass,log,msg:'PHP2Shell: unusually high request header count (OOM amplification?)',severity:WARNING,tag:'cve/CVE-2026-109618'"
+
+# Chunked encoding on a request that also names the progress field. Phase 2
+# sees the body, so this only fires when the field is actually present.
+SecRule REQUEST_BODY "@contains PHP_SESSION_UPLOAD_PROGRESS" \
+    "id:261096191,phase:2,pass,log,msg:'PHP2Shell: upload-progress field in request body',severity:WARNING,tag:'cve/CVE-2026-109618'"
+
+SecRule REQUEST_HEADERS:Transfer-Encoding "@contains chunked" \
+    "id:261096192,phase:1,pass,log,msg:'PHP2Shell: chunked transfer-encoding (post_max_size bypass)',severity:WARNING,tag:'cve/CVE-2026-109618'"
+
+# --- Runtime signals (host-level, not network) ------------------------------
+# Not signatures, but what to grep for after an alert fires:
+#   journalctl /var/log/apache2/error.log /var/log/nginx/error.log:
+#     "Allowed memory size of ... bytes exhausted"   <- OOM probe landed
+#     repeated HTTP 500s from the same source IP     <- worker churn
+#   ps aux | grep -E 'php-fpm|apache2|httpd':
+#     worker spawning sh/bash                        <- post-compromise signal
+#   malformed oversized PHPSESSID response cookies    <- disclosure arm
